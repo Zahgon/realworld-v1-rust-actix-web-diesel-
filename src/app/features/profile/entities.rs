@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Queryable, Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Profile {
     pub username: String,
     pub bio: Option<String>,

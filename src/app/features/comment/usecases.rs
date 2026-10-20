@@ -2,7 +2,7 @@ use super::presenters::CommentPresenter;
 use super::repositories::CommentRepository;
 use crate::app::features::user::entities::User;
 use crate::error::AppError;
-use actix_web::HttpResponse;
+use axum::response::Response;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -23,34 +23,36 @@ impl CommentUsecase {
         }
     }
 
-    pub fn fetch_comments(&self, user: &Option<User>) -> Result<HttpResponse, AppError> {
-        let result = self.comment_repository.fetch_comments(user)?;
+    pub async fn fetch_comments(&self, user: &Option<User>) -> Result<Response, AppError> {
+        let result = self.comment_repository.fetch_comments(user).await?;
         let res = self.comment_presenter.to_multi_json(result);
         Ok(res)
     }
 
-    pub fn create_comment(
+    pub async fn create_comment(
         &self,
         body: String,
         article_title_slug: String,
         author: User,
-    ) -> Result<HttpResponse, AppError> {
+    ) -> Result<Response, AppError> {
         let result = self
             .comment_repository
-            .create_comment(body, article_title_slug, author)?;
+            .create_comment(body, article_title_slug, author)
+            .await?;
         let res = self.comment_presenter.to_single_json(result);
         Ok(res)
     }
 
-    pub fn delete_comment(
+    pub async fn delete_comment(
         &self,
         article_title_slug: &str,
         comment_id: Uuid,
         author_id: Uuid,
-    ) -> Result<HttpResponse, AppError> {
+    ) -> Result<Response, AppError> {
         let _ = self
             .comment_repository
-            .delete_comment(article_title_slug, comment_id, author_id);
+            .delete_comment(article_title_slug, comment_id, author_id)
+            .await;
         let res = self.comment_presenter.to_http_res();
         Ok(res)
     }

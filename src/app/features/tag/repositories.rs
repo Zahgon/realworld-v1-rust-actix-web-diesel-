@@ -1,9 +1,11 @@
 use super::entities::Tag;
 use crate::error::AppError;
 use crate::utils::db::DbPool;
+use async_trait::async_trait;
 
+#[async_trait]
 pub trait TagRepository: Send + Sync + 'static {
-    fn fetch_tags(&self) -> Result<Vec<Tag>, AppError>;
+    async fn fetch_tags(&self) -> Result<Vec<Tag>, AppError>;
 }
 
 #[derive(Clone)]
@@ -17,9 +19,10 @@ impl TagRepositoryImpl {
     }
 }
 
+#[async_trait]
 impl TagRepository for TagRepositoryImpl {
-    fn fetch_tags(&self) -> Result<Vec<Tag>, AppError> {
-        let conn = &mut self.pool.get()?;
-        Tag::fetch(conn)
+    async fn fetch_tags(&self) -> Result<Vec<Tag>, AppError> {
+        let mut conn = self.pool.acquire().await?;
+        Tag::fetch(&mut conn).await
     }
 }

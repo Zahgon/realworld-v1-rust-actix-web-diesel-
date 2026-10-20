@@ -1,5 +1,6 @@
 use crate::{app::features::user::entities::User, error::AppError};
-use actix_web::HttpResponse;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::convert::From;
 
@@ -33,8 +34,8 @@ pub struct AuthUser {
 }
 
 pub trait UserPresenter: Send + Sync + 'static {
-    fn to_json(&self, user: User, token: String) -> HttpResponse;
-    fn to_auth_middleware(&self, maybe_uesr: Result<User, AppError>) -> Result<User, &str>;
+    fn to_json(&self, user: User, token: String) -> Response;
+    fn to_auth_middleware(&self, maybe_uesr: Result<User, AppError>) -> Result<User, &'static str>;
 }
 
 #[derive(Clone)]
@@ -45,12 +46,12 @@ impl UserPresenterImpl {
     }
 }
 impl UserPresenter for UserPresenterImpl {
-    fn to_json(&self, user: User, token: String) -> HttpResponse {
+    fn to_json(&self, user: User, token: String) -> Response {
         let res_model = UserResponse::from((user, token));
-        HttpResponse::Ok().json(res_model)
+        Json(res_model).into_response()
     }
 
-    fn to_auth_middleware(&self, maybe_user: Result<User, AppError>) -> Result<User, &str> {
+    fn to_auth_middleware(&self, maybe_user: Result<User, AppError>) -> Result<User, &'static str> {
         maybe_user.map_err(|_err| "Cannot find auth user")
     }
 }

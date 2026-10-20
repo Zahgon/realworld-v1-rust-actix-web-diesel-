@@ -1,19 +1,13 @@
-use crate::app::features::favorite::entities::Favorite;
 use crate::app::features::user::entities::User;
 use crate::error::AppError;
-use crate::schema::articles;
 use crate::utils::converter;
 use chrono::NaiveDateTime;
-use diesel::dsl::Eq;
-use diesel::pg::PgConnection;
-use diesel::prelude::*;
-use diesel::Insertable;
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::{PgConnection, PgRow};
+use sqlx::{FromRow, Row};
 use uuid::Uuid;
 
-#[derive(Identifiable, Queryable, Debug, Serialize, Deserialize, Associations, Clone)]
-#[diesel(belongs_to(User, foreign_key = author_id))]
-#[diesel(table_name = articles)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Article {
     pub id: Uuid,
     pub author_id: Uuid,
@@ -25,43 +19,106 @@ pub struct Article {
     pub updated_at: NaiveDateTime,
 }
 
-type WithAuthorId<T> = Eq<articles::author_id, T>;
-type WithSlug<T> = Eq<articles::slug, T>;
-type WithId<T> = Eq<articles::id, T>;
-
 impl Article {
-    fn with_author_id(author_id: &Uuid) -> WithAuthorId<&Uuid> {
-        articles::author_id.eq(author_id)
+    pub const COLUMNS: &'static str = "articles.id, articles.author_id, articles.slug, \
+        articles.title, articles.description, articles.body, articles.created_at, \
+        articles.updated_at";
+
+    /// Index of the first author column in rows selected with `WITH_AUTHOR_COLUMNS`.
+    pub const AUTHOR_OFFSET: usize = 8;
+
+    pub fn from_row_at(row: &PgRow, start: usize) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get(start)?,
+            author_id: row.try_get(start + 1)?,
+            slug: row.try_get(start + 2)?,
+            title: row.try_get(start + 3)?,
+            description: row.try_get(start + 4)?,
+            body: row.try_get(start + 5)?,
+            created_at: row.try_get(start + 6)?,
+            updated_at: row.try_get(start + 7)?,
+        })
     }
 
-    fn with_slug(slug: &str) -> WithSlug<&str> {
-        articles::slug.eq(slug)
+    pub fn with_author_from_row(row: &PgRow) -> Result<(Self, User), sqlx::Error> {
+        Ok((
+            Self::from_row_at(row, 0)?,
+            User::from_row_at(row, Self::AUTHOR_OFFSET)?,
+        ))
     }
 
-    fn with_id(id: &Uuid) -> WithId<&Uuid> {
-        articles::id.eq(id)
+    pub fn with_author_columns() -> String {
+        format!("{}, {}", Self::COLUMNS, User::COLUMNS)
+    }
+}
+
+impl<'r> FromRow<'r, PgRow> for Article {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        Self::from_row_at(row, 0)
     }
 }
 
 impl Article {
-    pub fn create(conn: &mut PgConnection, record: &CreateArticle) -> Result<Self, AppError> {
-        let article = diesel::insert_into(articles::table)
-            .values(record)
-            .get_result::<Article>(conn)?;
+    pub async fn create(conn: &mut PgConnection, record: &CreateArticle) -> Result<Self, AppError> {
+        let article = sqlx::query_as::<_, Article>(&format!(
+            "INSERT INTO articles (author_id, slug, title, description, body) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING {}",
+            Self::COLUMNS
+        ))
+        .bind(record.author_id)
+        .bind(&record.slug)
+        .bind(&record.title)
+        .bind(&record.description)
+        .bind(&record.body)
+        .fetch_one(&mut *conn)
+        .await?;
 
         Ok(article)
     }
 
-    pub fn update(
+    pub async fn update(
         conn: &mut PgConnection,
         article_title_slug: &str,
         author_id: &Uuid,
         record: &UpdateArticle,
     ) -> Result<Self, AppError> {
-        let t = articles::table
-            .filter(Self::with_slug(article_title_slug))
-            .filter(Self::with_author_id(author_id));
-        let article = diesel::update(t).set(record).get_result::<Article>(conn)?;
+        // Only the fields present in the record are written; with none
+        // present there is nothing to save, which the API answers with a 500.
+        let fields = [
+            ("slug", &record.slug),
+            ("title", &record.title),
+            ("description", &record.description),
+            ("body", &record.body),
+        ];
+        let mut assignments = Vec::new();
+        let mut values = Vec::new();
+        for (column, value) in fields {
+            if let Some(value) = value {
+                values.push(value);
+                assignments.push(format!("{column} = ${}", values.len()));
+            }
+        }
+        if assignments.is_empty() {
+            return Err(AppError::InternalServerError);
+        }
+
+        let sql = format!(
+            "UPDATE articles SET {} WHERE articles.slug = ${} AND articles.author_id = ${} \
+             RETURNING {}",
+            assignments.join(", "),
+            values.len() + 1,
+            values.len() + 2,
+            Self::COLUMNS
+        );
+        let mut query = sqlx::query_as::<_, Article>(&sql);
+        for value in values {
+            query = query.bind(value);
+        }
+        let article = query
+            .bind(article_title_slug)
+            .bind(author_id)
+            .fetch_one(&mut *conn)
+            .await?;
         Ok(article)
     }
 
@@ -69,56 +126,71 @@ impl Article {
         converter::to_kebab(title)
     }
 
-    pub fn fetch_by_slug_and_author_id(
+    pub async fn fetch_by_slug_and_author_id(
         conn: &mut PgConnection,
         params: &FetchBySlugAndAuthorId,
     ) -> Result<Self, AppError> {
-        let t = articles::table
-            .filter(Self::with_slug(&params.slug))
-            .filter(Self::with_author_id(&params.author_id));
-        let item = t.first::<Self>(conn)?;
+        let item = sqlx::query_as::<_, Article>(&format!(
+            "SELECT {} FROM articles WHERE articles.slug = $1 AND articles.author_id = $2 LIMIT 1",
+            Self::COLUMNS
+        ))
+        .bind(&params.slug)
+        .bind(params.author_id)
+        .fetch_one(&mut *conn)
+        .await?;
         Ok(item)
     }
 
-    pub fn fetch_by_slug_with_author(
+    pub async fn fetch_by_slug_with_author(
         conn: &mut PgConnection,
         slug: &str,
     ) -> Result<(Self, User), AppError> {
-        use crate::schema::users;
-        let t = articles::table
-            .inner_join(users::table)
-            .filter(Self::with_slug(slug));
-        let result = t.get_result::<(Self, User)>(conn)?;
-        Ok(result)
+        let row = sqlx::query(&format!(
+            "SELECT {} FROM articles INNER JOIN users ON articles.author_id = users.id \
+             WHERE articles.slug = $1",
+            Self::with_author_columns()
+        ))
+        .bind(slug)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(Self::with_author_from_row(&row)?)
     }
 
-    pub fn fetch_ids_by_author_name(
+    pub async fn fetch_ids_by_author_name(
         conn: &mut PgConnection,
         name: &str,
     ) -> Result<Vec<Uuid>, AppError> {
-        use crate::schema::users;
-        let t = users::table
-            .inner_join(articles::table)
-            .filter(User::with_username(name))
-            .select(articles::id);
-        let ids = t.load::<Uuid>(conn)?;
+        let ids = sqlx::query_scalar::<_, Uuid>(
+            "SELECT articles.id FROM users INNER JOIN articles ON articles.author_id = users.id \
+             WHERE users.username = $1",
+        )
+        .bind(name)
+        .fetch_all(&mut *conn)
+        .await?;
         Ok(ids)
     }
 
-    pub fn find_with_author(conn: &mut PgConnection, id: &Uuid) -> Result<(Self, User), AppError> {
-        use crate::schema::users;
-        let t = articles::table
-            .inner_join(users::table)
-            .filter(Self::with_id(id));
-        let result = t.get_result::<(Article, User)>(conn)?;
-        Ok(result)
+    pub async fn find_with_author(
+        conn: &mut PgConnection,
+        id: &Uuid,
+    ) -> Result<(Self, User), AppError> {
+        let row = sqlx::query(&format!(
+            "SELECT {} FROM articles INNER JOIN users ON articles.author_id = users.id \
+             WHERE articles.id = $1",
+            Self::with_author_columns()
+        ))
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(Self::with_author_from_row(&row)?)
     }
 
-    pub fn delete(conn: &mut PgConnection, params: &DeleteArticle) -> Result<(), AppError> {
-        let t = articles::table
-            .filter(Self::with_slug(&params.slug))
-            .filter(Self::with_author_id(&params.author_id));
-        diesel::delete(t).execute(conn)?;
+    pub async fn delete(conn: &mut PgConnection, params: &DeleteArticle) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM articles WHERE articles.slug = $1 AND articles.author_id = $2")
+            .bind(&params.slug)
+            .bind(params.author_id)
+            .execute(&mut *conn)
+            .await?;
         // NOTE: references tag rows are deleted automatically by DELETE CASCADE
 
         Ok(())
@@ -126,32 +198,35 @@ impl Article {
 }
 
 impl Article {
-    pub fn is_favorited_by_user_id(
+    pub async fn is_favorited_by_user_id(
         &self,
         conn: &mut PgConnection,
         user_id: &Uuid,
     ) -> Result<bool, AppError> {
-        use crate::schema::favorites;
-        let t = favorites::table
-            .select(diesel::dsl::count(favorites::id))
-            .filter(Favorite::with_article_id(&self.id))
-            .filter(Favorite::with_user_id(user_id));
-        let count = t.first::<i64>(conn)?;
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(favorites.id) FROM favorites \
+             WHERE favorites.article_id = $1 AND favorites.user_id = $2 LIMIT 1",
+        )
+        .bind(self.id)
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await?;
         Ok(count >= 1)
     }
 
-    pub fn fetch_favorites_count(&self, conn: &mut PgConnection) -> Result<i64, AppError> {
-        use crate::schema::favorites;
-        let t = favorites::table
-            .filter(Favorite::with_article_id(&self.id))
-            .select(diesel::dsl::count(favorites::created_at));
-        let favorites_count = t.first::<i64>(conn)?;
+    pub async fn fetch_favorites_count(&self, conn: &mut PgConnection) -> Result<i64, AppError> {
+        let favorites_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(favorites.created_at) FROM favorites \
+             WHERE favorites.article_id = $1 LIMIT 1",
+        )
+        .bind(self.id)
+        .fetch_one(&mut *conn)
+        .await?;
         Ok(favorites_count)
     }
 }
 
-#[derive(Insertable, Clone)]
-#[diesel(table_name = articles)]
+#[derive(Clone)]
 pub struct CreateArticle {
     pub author_id: Uuid,
     pub slug: String,
@@ -160,8 +235,6 @@ pub struct CreateArticle {
     pub body: String,
 }
 
-#[derive(AsChangeset)]
-#[diesel(table_name = articles)]
 pub struct UpdateArticle {
     pub slug: Option<String>,
     pub title: Option<String>,

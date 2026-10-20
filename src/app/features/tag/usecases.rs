@@ -1,7 +1,7 @@
 use super::presenters::TagPresenter;
 use super::repositories::TagRepository;
 use crate::error::AppError;
-use actix_web::HttpResponse;
+use axum::response::Response;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -21,8 +21,8 @@ impl TagUsecase {
         }
     }
 
-    pub fn fetch_tags(&self) -> Result<HttpResponse, AppError> {
-        let list = self.tag_repository.fetch_tags()?;
+    pub async fn fetch_tags(&self) -> Result<Response, AppError> {
+        let list = self.tag_repository.fetch_tags().await?;
         let res = self.tag_presenter.to_json(list);
         Ok(res)
     }

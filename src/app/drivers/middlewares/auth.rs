@@ -3,86 +3,32 @@ use crate::app::features::user::entities::User;
 use crate::constants;
 use crate::error::AppError;
 use crate::utils::token;
-use actix_web::HttpMessage;
-use actix_web::{
-    body::EitherBody,
-    dev::{Service, ServiceRequest, ServiceResponse, Transform},
-    http::Method,
-    web::Data,
-    Error, HttpRequest, HttpResponse,
-};
-use futures::future::{ok, Ready};
-use futures::Future;
+use axum::async_trait;
+use axum::extract::{FromRequestParts, Request, State};
+use axum::http::{request::Parts, Method, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use serde_json::json;
-use std::pin::Pin;
+use std::convert::Infallible;
 use uuid::Uuid;
 
-// There are two steps in middleware processing.
-// 1. Middleware initialization, middleware factory gets called with
-//    next service in chain as parameter.
-// 2. Middleware's call method gets called with normal request.
-pub struct Authentication;
-
-// Middleware factory is `Transform` trait from actix-service crate
-// `S` - type of the next service
-// `B` - type of response's body
-impl<S, B> Transform<S, ServiceRequest> for Authentication
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
-    S::Future: 'static,
-    B: 'static,
-{
-    type Response = ServiceResponse<EitherBody<B>>;
-    type Error = Error;
-    type InitError = ();
-    type Transform = AuthenticationMiddleware<S>;
-    type Future = Ready<Result<Self::Transform, Self::InitError>>;
-
-    fn new_transform(&self, service: S) -> Self::Future {
-        ok(AuthenticationMiddleware { service })
+// Runs ahead of CORS and routing for every request: a request that is neither
+// OPTIONS nor on SKIP_AUTH_ROUTES must carry a token for an existing user, or
+// it is answered 401 with an empty body.
+pub async fn authentication(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    let is_verified = if should_skip_auth(&req) {
+        true
+    } else {
+        set_auth_user(&state, &mut req).await
+    };
+    if is_verified {
+        next.run(req).await
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
     }
 }
 
-pub struct AuthenticationMiddleware<S> {
-    service: S,
-}
-
-impl<S, B> Service<ServiceRequest> for AuthenticationMiddleware<S>
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
-    S::Future: 'static,
-    B: 'static,
-{
-    type Response = ServiceResponse<EitherBody<B>>;
-    type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
-
-    actix_web::dev::forward_ready!(service);
-
-    fn call(&self, mut req: ServiceRequest) -> Self::Future {
-        let is_verified = if should_skip_auth(&req) {
-            true
-        } else {
-            set_auth_user(&mut req)
-        };
-        if is_verified {
-            let fut = self.service.call(req);
-            Box::pin(async move {
-                let res = fut.await?.map_into_left_body();
-                Ok(res)
-            })
-        } else {
-            Box::pin(async move {
-                let (req, _res) = req.into_parts();
-                let res = HttpResponse::Unauthorized().finish().map_into_right_body();
-                let srv = ServiceResponse::new(req, res);
-                Ok(srv)
-            })
-        }
-    }
-}
-
-fn should_skip_auth(req: &ServiceRequest) -> bool {
+fn should_skip_auth(req: &Request) -> bool {
     let method = req.method();
     if Method::OPTIONS == *method {
         return true;
@@ -90,13 +36,13 @@ fn should_skip_auth(req: &ServiceRequest) -> bool {
 
     SKIP_AUTH_ROUTES
         .iter()
-        .any(|route| route.matches_path_and_method(req.path(), req.method()))
+        .any(|route| route.matches_path_and_method(req.uri().path(), req.method()))
 }
 
 const TOKEN_IDENTIFIER: &str = "Token";
 
-fn set_auth_user(req: &mut ServiceRequest) -> bool {
-    match fetch_user(req) {
+async fn set_auth_user(state: &AppState, req: &mut Request) -> bool {
+    match fetch_user(state, get_user_id_from_header(req)).await {
         Ok(user) => {
             req.extensions_mut().insert(user);
             true
@@ -108,14 +54,14 @@ fn set_auth_user(req: &mut ServiceRequest) -> bool {
     }
 }
 
-fn fetch_user(req: &ServiceRequest) -> Result<User, &str> {
-    let user_id = get_user_id_from_header(req)?;
-    req.app_data::<Data<AppState>>()
-        .ok_or("Cannot get app state.")
-        .and_then(|state| state.di_container.user_usecase.find_auth_user(user_id))
+async fn fetch_user(
+    state: &AppState,
+    user_id: Result<Uuid, &'static str>,
+) -> Result<User, &'static str> {
+    state.di_container.user_usecase.find_auth_user(user_id?).await
 }
 
-fn get_user_id_from_header(req: &ServiceRequest) -> Result<Uuid, &str> {
+fn get_user_id_from_header(req: &Request) -> Result<Uuid, &'static str> {
     req.headers()
         .get(constants::AUTHORIZATION)
         .ok_or("Cannot find authrization key-value in req header")
@@ -132,13 +78,22 @@ fn get_user_id_from_header(req: &ServiceRequest) -> Result<Uuid, &str> {
         .map(|token| token.claims.user_id)
 }
 
-pub fn get_current_user(req: &HttpRequest) -> Result<User, AppError> {
-    req.extensions()
-        .get::<User>()
-        .map(|user| user.to_owned())
-        .ok_or_else(|| {
-            AppError::Unauthorized(json!({"error": "Unauthrized user. Need auth token on header."}))
-        })
+/// The user the authentication middleware attached to the request, if any.
+pub struct CurrentUser(Option<User>);
+
+#[async_trait]
+impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(CurrentUser(parts.extensions.get::<User>().cloned()))
+    }
+}
+
+pub fn get_current_user(req: &CurrentUser) -> Result<User, AppError> {
+    req.0.as_ref().map(|user| user.to_owned()).ok_or_else(|| {
+        AppError::Unauthorized(json!({"error": "Unauthrized user. Need auth token on header."}))
+    })
 }
 
 struct SkipAuthRoute {
@@ -183,7 +138,7 @@ impl SkipAuthRoute {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::http::Method;
+    use axum::http::Method;
     #[test]
     fn is_match_path_and_method_test() {
         let route = SkipAuthRoute {

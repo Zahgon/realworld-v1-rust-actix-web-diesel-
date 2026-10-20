@@ -8,22 +8,24 @@ use crate::{
     error::AppError,
     utils::db::DbPool,
 };
+use async_trait::async_trait;
 use uuid::Uuid;
 
+#[async_trait]
 pub trait CommentRepository: Send + Sync + 'static {
-    fn fetch_comments(
+    async fn fetch_comments(
         &self,
         current_user: &Option<User>,
     ) -> Result<Vec<(Comment, Profile)>, AppError>;
 
-    fn create_comment(
+    async fn create_comment(
         &self,
         body: String,
         article_title_slug: String,
         author: User,
     ) -> Result<(Comment, Profile), AppError>;
 
-    fn delete_comment(
+    async fn delete_comment(
         &self,
         article_title_slug: &str,
         comment_id: Uuid,
@@ -41,71 +43,66 @@ impl CommentRepositoryImpl {
         Self { pool }
     }
 }
+
+#[async_trait]
 impl CommentRepository for CommentRepositoryImpl {
-    fn fetch_comments(
+    async fn fetch_comments(
         &self,
         current_user: &Option<User>,
     ) -> Result<Vec<(Comment, Profile)>, AppError> {
-        let conn = &mut self.pool.get()?;
+        let mut conn = self.pool.acquire().await?;
 
-        let comments = {
-            use crate::schema::comments;
-            use crate::schema::users;
-            use diesel::prelude::*;
-            comments::table
-                .inner_join(users::table)
-                .get_results::<(Comment, User)>(conn)?
-        };
+        let comments = Comment::fetch_all_with_author(&mut conn).await?;
 
-        let comments = comments
-            .iter()
-            .map(|(comment, user)| {
-                // TODO: avoid N+1. Write one query to fetch all data somehow.
-                let profile = user.to_profile(conn, current_user);
+        let mut list = Vec::with_capacity(comments.len());
+        for (comment, user) in comments.iter() {
+            // TODO: avoid N+1. Write one query to fetch all data somehow.
+            let profile = user.to_profile(&mut conn, current_user).await;
 
-                // TODO: avoid copy
-                (comment.to_owned(), profile)
-            })
-            .collect::<Vec<(Comment, Profile)>>();
+            // TODO: avoid copy
+            list.push((comment.to_owned(), profile));
+        }
 
-        Ok(comments)
+        Ok(list)
     }
 
-    fn create_comment(
+    async fn create_comment(
         &self,
         body: String,
         article_title_slug: String,
         author: User,
     ) -> Result<(Comment, Profile), AppError> {
-        let conn = &mut self.pool.get()?;
+        let mut conn = self.pool.acquire().await?;
 
         let article = Article::fetch_by_slug_and_author_id(
-            conn,
+            &mut conn,
             &FetchBySlugAndAuthorId {
                 slug: article_title_slug,
                 author_id: author.id,
             },
-        )?;
+        )
+        .await?;
         let comment = Comment::create(
-            conn,
+            &mut conn,
             &CreateComment {
                 body,
                 author_id: author.id,
                 article_id: article.id.to_owned(),
             },
-        )?;
-        let profile = author.fetch_profile(conn, &author.id)?;
+        )
+        .await?;
+        let profile = author.fetch_profile(&mut conn, &author.id).await?;
         Ok((comment, profile))
     }
 
-    fn delete_comment(
+    async fn delete_comment(
         &self,
         article_title_slug: &str,
         comment_id: Uuid,
         author_id: Uuid,
     ) -> Result<(), AppError> {
-        let conn = &mut self.pool.get()?;
-        let _ = Comment::delete(conn, (&comment_id, &author_id, article_title_slug));
+        let mut conn = self.pool.acquire().await?;
+        let _ = Comment::delete(&mut conn, (&comment_id, &author_id, article_title_slug)).await;
         Ok(())
     }
 }

@@ -7,7 +7,7 @@ use super::repositories::{
 };
 use crate::app::features::user::entities::User;
 use crate::error::AppError;
-use actix_web::HttpResponse;
+use axum::response::Response;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -28,55 +28,58 @@ impl ArticleUsecase {
         }
     }
 
-    pub fn fetch_articles(
+    pub async fn fetch_articles(
         &self,
         params: FetchArticlesUsecaseInput,
-    ) -> Result<HttpResponse, AppError> {
-        let (list, count) =
-            self.article_repository
-                .fetch_articles(FetchArticlesRepositoryInput {
-                    tag: params.tag.clone(),
-                    author: params.author.clone(),
-                    favorited: params.favorited.clone(),
-                    offset: params.offset,
-                    limit: params.limit,
-                })?;
+    ) -> Result<Response, AppError> {
+        let (list, count) = self
+            .article_repository
+            .fetch_articles(FetchArticlesRepositoryInput {
+                tag: params.tag.clone(),
+                author: params.author.clone(),
+                favorited: params.favorited.clone(),
+                offset: params.offset,
+                limit: params.limit,
+            })
+            .await?;
         let res = self.article_presenter.to_multi_json(list, count);
         Ok(res)
     }
 
-    pub fn fetch_article_by_slug(
+    pub async fn fetch_article_by_slug(
         &self,
         article_title_slug: String,
-    ) -> Result<HttpResponse, AppError> {
+    ) -> Result<Response, AppError> {
         let result = self
             .article_repository
-            .fetch_article_by_slug(article_title_slug)?;
+            .fetch_article_by_slug(article_title_slug)
+            .await?;
         let res = self.article_presenter.to_single_json(result);
         Ok(res)
     }
 
-    pub fn fetch_following_articles(
+    pub async fn fetch_following_articles(
         &self,
         user: User,
         offset: i64,
         limit: i64,
-    ) -> Result<HttpResponse, AppError> {
-        let (list, count) = self.article_repository.fetch_following_articles(
-            &FetchFollowingArticlesRepositoryInput {
+    ) -> Result<Response, AppError> {
+        let (list, count) = self
+            .article_repository
+            .fetch_following_articles(&FetchFollowingArticlesRepositoryInput {
                 current_user: user,
                 offset,
                 limit,
-            },
-        )?;
+            })
+            .await?;
         let res = self.article_presenter.to_multi_json(list, count);
         Ok(res)
     }
 
-    pub fn create_article(
+    pub async fn create_article(
         &self,
         params: CreateArticleUsecaseInput,
-    ) -> Result<HttpResponse, AppError> {
+    ) -> Result<Response, AppError> {
         let slug = Article::convert_title_to_slug(&params.title);
         let result = self
             .article_repository
@@ -87,28 +90,30 @@ impl ArticleUsecase {
                 tag_name_list: params.tag_name_list,
                 title: params.title,
                 slug,
-            })?;
+            })
+            .await?;
         let res = self.article_presenter.to_single_json(result);
         Ok(res)
     }
 
-    pub fn delete_article(
+    pub async fn delete_article(
         &self,
         input: DeleteArticleUsecaseInput,
-    ) -> Result<HttpResponse, AppError> {
+    ) -> Result<Response, AppError> {
         self.article_repository
             .delete_article(DeleteArticleRepositoryInput {
                 slug: input.slug,
                 author_id: input.author_id,
-            })?;
+            })
+            .await?;
         let res = self.article_presenter.to_http_res();
         Ok(res)
     }
 
-    pub fn update_article(
+    pub async fn update_article(
         &self,
         input: UpdateArticleUsecaseInput,
-    ) -> Result<HttpResponse, AppError> {
+    ) -> Result<Response, AppError> {
         let article_slug = &input
             .title
             .as_ref()
@@ -123,7 +128,8 @@ impl ArticleUsecase {
                 title: input.title,
                 description: input.description,
                 body: input.body,
-            })?;
+            })
+            .await?;
         let res = self.article_presenter.to_single_json(result);
         Ok(res)
     }

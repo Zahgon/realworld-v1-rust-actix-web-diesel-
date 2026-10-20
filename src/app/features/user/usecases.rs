@@ -2,7 +2,7 @@ use super::entities::{UpdateUser, User};
 use super::presenters::UserPresenter;
 use super::repositories::UserRepository;
 use crate::error::AppError;
-use actix_web::HttpResponse;
+use axum::response::Response;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -23,41 +23,41 @@ impl UserUsecase {
         }
     }
 
-    pub fn signin(&self, email: &str, password: &str) -> Result<HttpResponse, AppError> {
-        let (user, token) = self.user_repository.signin(email, password)?;
+    pub async fn signin(&self, email: &str, password: &str) -> Result<Response, AppError> {
+        let (user, token) = self.user_repository.signin(email, password).await?;
         let res = self.user_presenter.to_json(user, token);
         Ok(res)
     }
 
-    pub fn signup(
+    pub async fn signup(
         &self,
         email: &str,
         username: &str,
         password: &str,
-    ) -> Result<HttpResponse, AppError> {
-        let (user, token) = self.user_repository.signup(email, username, password)?;
+    ) -> Result<Response, AppError> {
+        let (user, token) = self.user_repository.signup(email, username, password).await?;
         let res = self.user_presenter.to_json(user, token);
         Ok(res)
     }
 
-    pub fn get_token(&self, current_user: &User) -> Result<HttpResponse, AppError> {
+    pub fn get_token(&self, current_user: &User) -> Result<Response, AppError> {
         let token = current_user.generate_token()?;
         let res = self.user_presenter.to_json(current_user.clone(), token);
         Ok(res)
     }
 
-    pub fn update_user(
+    pub async fn update_user(
         &self,
         user_id: Uuid,
         changeset: UpdateUser,
-    ) -> Result<HttpResponse, AppError> {
-        let (new_user, token) = self.user_repository.update(user_id, changeset)?;
+    ) -> Result<Response, AppError> {
+        let (new_user, token) = self.user_repository.update(user_id, changeset).await?;
         let res = self.user_presenter.to_json(new_user, token);
         Ok(res)
     }
 
-    pub fn find_auth_user(&self, user_id: Uuid) -> Result<User, &str> {
-        let maybe_user = self.user_repository.find(user_id);
+    pub async fn find_auth_user(&self, user_id: Uuid) -> Result<User, &'static str> {
+        let maybe_user = self.user_repository.find(user_id).await;
         self.user_presenter.to_auth_middleware(maybe_user)
     }
 }

@@ -1,20 +1,14 @@
-use crate::app::features::favorite::entities::Favorite;
-use crate::app::features::follow::entities::Follow;
 use crate::app::features::profile::entities::Profile;
 use crate::error::AppError;
-use crate::schema::users;
 use crate::utils::{hasher, token};
 use chrono::prelude::*;
 use chrono::NaiveDateTime;
-use diesel::backend::Backend;
-use diesel::dsl::{AsSelect, Eq, Filter, Select};
-use diesel::pg::PgConnection;
-use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::{PgConnection, PgRow};
+use sqlx::{FromRow, Row};
 use uuid::Uuid;
 
-#[derive(Identifiable, Queryable, Selectable, Serialize, Deserialize, Debug, Clone)]
-#[diesel(table_name = users)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
     pub id: Uuid,
     pub email: String,
@@ -28,151 +22,186 @@ pub struct User {
 
 type Token = String;
 
-type All<DB> = Select<users::table, AsSelect<User, DB>>;
-type WithUsername<T> = Eq<users::username, T>;
-type WithEmail<T> = Eq<users::email, T>;
-type ByUsername<DB, T> = Filter<All<DB>, WithUsername<T>>;
-type ByEmail<DB, T> = Filter<All<DB>, WithEmail<T>>;
-
 impl User {
-    fn all<DB>() -> All<DB>
-    where
-        DB: Backend,
-    {
-        users::table.select(User::as_select())
-    }
+    pub const COLUMNS: &'static str = "users.id, users.email, users.username, users.password, \
+        users.bio, users.image, users.created_at, users.updated_at";
 
-    pub fn with_username(username: &str) -> WithUsername<&str> {
-        users::username.eq(username)
+    /// Reads a user from `row` starting at column `start` (joined rows put the
+    /// user's columns after another table's).
+    pub fn from_row_at(row: &PgRow, start: usize) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get(start)?,
+            email: row.try_get(start + 1)?,
+            username: row.try_get(start + 2)?,
+            password: row.try_get(start + 3)?,
+            bio: row.try_get(start + 4)?,
+            image: row.try_get(start + 5)?,
+            created_at: row.try_get(start + 6)?,
+            updated_at: row.try_get(start + 7)?,
+        })
     }
+}
 
-    pub fn by_username<DB>(username: &str) -> ByUsername<DB, &str>
-    where
-        DB: Backend,
-    {
-        Self::all().filter(Self::with_username(username))
-    }
-
-    fn with_email(email: &str) -> WithEmail<&str> {
-        users::email.eq(email)
-    }
-
-    fn by_email<DB>(email: &str) -> ByEmail<DB, &str>
-    where
-        DB: Backend,
-    {
-        Self::all().filter(Self::with_email(email))
+impl<'r> FromRow<'r, PgRow> for User {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        Self::from_row_at(row, 0)
     }
 }
 
 impl User {
-    pub fn signup<'a>(
+    pub async fn signup(
         conn: &mut PgConnection,
-        email: &'a str,
-        username: &'a str,
-        naive_password: &'a str,
+        email: &str,
+        username: &str,
+        naive_password: &str,
     ) -> Result<(User, Token), AppError> {
-        use diesel::prelude::*;
-        let hashed_password = hasher::hash_password(naive_password)?;
+        let hashed_password = hasher::hash_password(naive_password).await?;
 
-        let record = SignupUser {
-            email,
-            username,
-            password: &hashed_password,
-        };
-
-        let user = diesel::insert_into(users::table)
-            .values(&record)
-            .get_result::<User>(conn)?;
+        let user = sqlx::query_as::<_, User>(&format!(
+            "INSERT INTO users (email, username, password) VALUES ($1, $2, $3) RETURNING {}",
+            Self::COLUMNS
+        ))
+        .bind(email)
+        .bind(username)
+        .bind(&hashed_password)
+        .fetch_one(&mut *conn)
+        .await?;
 
         let token = user.generate_token()?;
         Ok((user, token))
     }
 
-    pub fn signin(
+    pub async fn signin(
         conn: &mut PgConnection,
         email: &str,
         naive_password: &str,
     ) -> Result<(User, Token), AppError> {
-        let t = Self::by_email(email).limit(1);
-        let user = t.first::<User>(conn)?;
-        hasher::verify(naive_password, &user.password)?;
+        let user = sqlx::query_as::<_, User>(&format!(
+            "SELECT {} FROM users WHERE users.email = $1 LIMIT 1",
+            Self::COLUMNS
+        ))
+        .bind(email)
+        .fetch_one(&mut *conn)
+        .await?;
+        hasher::verify(naive_password, &user.password).await?;
         let token = user.generate_token()?;
         Ok((user, token))
     }
 
-    pub fn find(conn: &mut PgConnection, id: Uuid) -> Result<Self, AppError> {
-        let t = users::table.find(id);
-        let user = t.first(conn)?;
+    pub async fn find(conn: &mut PgConnection, id: Uuid) -> Result<Self, AppError> {
+        let user = sqlx::query_as::<_, User>(&format!(
+            "SELECT {} FROM users WHERE users.id = $1 LIMIT 1",
+            Self::COLUMNS
+        ))
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
         Ok(user)
     }
 
-    pub fn update(
+    pub async fn update(
         conn: &mut PgConnection,
         user_id: Uuid,
         changeset: UpdateUser,
     ) -> Result<Self, AppError> {
-        let target = users::table.find(user_id);
-        let user = diesel::update(target)
-            .set(changeset)
-            .get_result::<User>(conn)?;
+        // Only the fields present in the changeset are written; with none
+        // present there is nothing to save, which the API answers with a 500.
+        let fields = [
+            ("email", changeset.email),
+            ("username", changeset.username),
+            ("password", changeset.password),
+            ("image", changeset.image),
+            ("bio", changeset.bio),
+        ];
+        let mut assignments = Vec::new();
+        let mut values = Vec::new();
+        for (column, value) in fields {
+            if let Some(value) = value {
+                values.push(value);
+                assignments.push(format!("{column} = ${}", values.len()));
+            }
+        }
+        if assignments.is_empty() {
+            return Err(AppError::InternalServerError);
+        }
+
+        let sql = format!(
+            "UPDATE users SET {} WHERE users.id = ${} RETURNING {}",
+            assignments.join(", "),
+            values.len() + 1,
+            Self::COLUMNS
+        );
+        let mut query = sqlx::query_as::<_, User>(&sql);
+        for value in values {
+            query = query.bind(value);
+        }
+        let user = query.bind(user_id).fetch_one(&mut *conn).await?;
         Ok(user)
     }
 
-    pub fn find_by_username(conn: &mut PgConnection, username: &str) -> Result<Self, AppError> {
-        let t = Self::by_username(username).limit(1);
-        let user = t.first::<User>(conn)?;
+    pub async fn find_by_username(conn: &mut PgConnection, username: &str) -> Result<Self, AppError> {
+        let user = sqlx::query_as::<_, User>(&format!(
+            "SELECT {} FROM users WHERE users.username = $1 LIMIT 1",
+            Self::COLUMNS
+        ))
+        .bind(username)
+        .fetch_one(&mut *conn)
+        .await?;
         Ok(user)
     }
 
-    pub fn is_following(&self, conn: &mut PgConnection, followee_id: &Uuid) -> bool {
-        use crate::schema::follows;
-        let t = follows::table
-            .filter(Follow::with_followee(followee_id))
-            .filter(Follow::with_follower(&self.id));
-        let follow = t.get_result::<Follow>(conn);
-        follow.is_ok()
+    pub async fn is_following(&self, conn: &mut PgConnection, followee_id: &Uuid) -> bool {
+        let follow = sqlx::query(
+            "SELECT follows.followee_id FROM follows \
+             WHERE follows.followee_id = $1 AND follows.follower_id = $2",
+        )
+        .bind(followee_id)
+        .bind(self.id)
+        .fetch_optional(&mut *conn)
+        .await;
+        matches!(follow, Ok(Some(_)))
     }
 }
 
 impl User {
     pub fn generate_token(&self) -> Result<String, AppError> {
-        let now = Utc::now().timestamp_nanos() / 1_000_000_000; // nanosecond -> second
+        let now = Utc::now().timestamp();
         let token = token::generate(self.id, now)?;
         Ok(token)
     }
 
-    pub fn fetch_favorited_article_ids(
+    pub async fn fetch_favorited_article_ids(
         &self,
         conn: &mut PgConnection,
     ) -> Result<Vec<Uuid>, AppError> {
-        use crate::schema::favorites;
-        let t = favorites::table
-            .filter(Favorite::with_user_id(&self.id))
-            .select(favorites::article_id);
-        let favorited_article_ids = t.get_results::<Uuid>(conn)?;
+        let favorited_article_ids = sqlx::query_scalar::<_, Uuid>(
+            "SELECT favorites.article_id FROM favorites WHERE favorites.user_id = $1",
+        )
+        .bind(self.id)
+        .fetch_all(&mut *conn)
+        .await?;
         Ok(favorited_article_ids)
     }
 
-    pub fn fetch_profile(
+    pub async fn fetch_profile(
         &self,
         conn: &mut PgConnection,
         folowee_id: &Uuid,
     ) -> Result<Profile, AppError> {
-        let is_following = &self.is_following(conn, folowee_id);
+        let is_following = self.is_following(conn, folowee_id).await;
         let profile = Profile {
             username: self.username.to_owned(),
             bio: self.bio.to_owned(),
             image: self.image.to_owned(),
-            following: is_following.to_owned(),
+            following: is_following,
         };
         Ok(profile)
     }
 
-    pub fn to_profile(&self, conn: &mut PgConnection, current_user: &Option<User>) -> Profile {
+    pub async fn to_profile(&self, conn: &mut PgConnection, current_user: &Option<User>) -> Profile {
         let user = self;
         let following = match current_user {
-            Some(current_user) => current_user.is_following(conn, &user.id),
+            Some(current_user) => current_user.is_following(conn, &user.id).await,
             None => false,
         };
 
@@ -185,16 +214,7 @@ impl User {
     }
 }
 
-#[derive(Insertable, Debug, Deserialize)]
-#[diesel(table_name = users)]
-pub struct SignupUser<'a> {
-    pub email: &'a str,
-    pub username: &'a str,
-    pub password: &'a str,
-}
-
-#[derive(AsChangeset, Debug, Deserialize, Clone)]
-#[diesel(table_name = users)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct UpdateUser {
     pub email: Option<String>,
     pub username: Option<String>,

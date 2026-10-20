@@ -3,10 +3,11 @@ use crate::app::features::article::entities::Article;
 pub use crate::app::features::article::presenters::SingleArticleResponse;
 use crate::app::features::profile::entities::Profile;
 use crate::app::features::tag::entities::Tag;
-use actix_web::HttpResponse;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 
 pub trait FavoritePresenter: Send + Sync + 'static {
-    fn to_single_json(&self, item: (Article, Profile, FavoriteInfo, Vec<Tag>)) -> HttpResponse;
+    fn to_single_json(&self, item: (Article, Profile, FavoriteInfo, Vec<Tag>)) -> Response;
 }
 
 #[derive(Clone)]
@@ -20,8 +21,8 @@ impl FavoritePresenter for FavoritePresenterImpl {
     fn to_single_json(
         &self,
         (article, profile, favorite_info, tags_list): (Article, Profile, FavoriteInfo, Vec<Tag>),
-    ) -> HttpResponse {
+    ) -> Response {
         let res_model = SingleArticleResponse::from((article, profile, favorite_info, tags_list));
-        HttpResponse::Ok().json(res_model)
+        Json(res_model).into_response()
     }
 }

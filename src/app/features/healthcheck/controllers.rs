@@ -1,5 +1,6 @@
-use actix_web::{HttpResponse, Responder};
+use axum::body::Body;
+use axum::response::Response;
 
-pub async fn index() -> impl Responder {
-    HttpResponse::Ok().body("OK")
+pub async fn index() -> Response {
+    Response::new(Body::from("OK"))
 }

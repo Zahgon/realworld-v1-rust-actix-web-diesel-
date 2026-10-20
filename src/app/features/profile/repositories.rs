@@ -2,9 +2,11 @@ use super::entities::Profile;
 use crate::app::features::user::entities::User;
 use crate::error::AppError;
 use crate::utils::db::DbPool;
+use async_trait::async_trait;
 
+#[async_trait]
 pub trait ProfileRepository: Send + Sync + 'static {
-    fn fetch_profile_by_name(
+    async fn fetch_profile_by_name(
         &self,
         current_user: &User,
         username: &str,
@@ -22,16 +24,17 @@ impl ProfileRepositoryImpl {
     }
 }
 
+#[async_trait]
 impl ProfileRepository for ProfileRepositoryImpl {
-    fn fetch_profile_by_name(
+    async fn fetch_profile_by_name(
         &self,
         current_user: &User,
         username: &str,
     ) -> Result<Profile, AppError> {
-        let conn = &mut self.pool.get()?;
+        let mut conn = self.pool.acquire().await?;
         let profile = {
-            let followee = User::find_by_username(conn, username)?;
-            current_user.fetch_profile(conn, &followee.id)?
+            let followee = User::find_by_username(&mut conn, username).await?;
+            current_user.fetch_profile(&mut conn, &followee.id).await?
         };
         Ok(profile)
     }

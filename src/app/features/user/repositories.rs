@@ -4,26 +4,32 @@ use crate::app::features::profile::entities::Profile;
 use crate::app::features::user::entities::User;
 use crate::error::AppError;
 use crate::utils::db::DbPool;
+use async_trait::async_trait;
 use uuid::Uuid;
 
 type Token = String;
 
+#[async_trait]
 pub trait UserRepository: Send + Sync + 'static {
-    fn signin(&self, email: &str, naive_password: &str) -> Result<(User, Token), AppError>;
-    fn signup(
+    async fn signin(&self, email: &str, naive_password: &str) -> Result<(User, Token), AppError>;
+    async fn signup(
         &self,
         email: &str,
         username: &str,
         naive_password: &str,
     ) -> Result<(User, Token), AppError>;
-    fn follow_user(&self, current_user: &User, target_username: &str) -> Result<Profile, AppError>;
-    fn unfollow_user(
+    async fn follow_user(
         &self,
         current_user: &User,
         target_username: &str,
     ) -> Result<Profile, AppError>;
-    fn update(&self, user_id: Uuid, changeset: UpdateUser) -> Result<(User, Token), AppError>;
-    fn find(&self, user_id: Uuid) -> Result<User, AppError>;
+    async fn unfollow_user(
+        &self,
+        current_user: &User,
+        target_username: &str,
+    ) -> Result<Profile, AppError>;
+    async fn update(&self, user_id: Uuid, changeset: UpdateUser) -> Result<(User, Token), AppError>;
+    async fn find(&self, user_id: Uuid) -> Result<User, AppError>;
 }
 
 #[derive(Clone)]
@@ -37,38 +43,39 @@ impl UserRepositoryImpl {
     }
 }
 
+#[async_trait]
 impl UserRepository for UserRepositoryImpl {
-    fn signin(&self, email: &str, naive_password: &str) -> Result<(User, Token), AppError> {
-        let conn = &mut self.pool.get()?;
-        User::signin(conn, email, naive_password)
+    async fn signin(&self, email: &str, naive_password: &str) -> Result<(User, Token), AppError> {
+        let mut conn = self.pool.acquire().await?;
+        User::signin(&mut conn, email, naive_password).await
     }
 
-    fn signup(
+    async fn signup(
         &self,
         email: &str,
         username: &str,
         naive_password: &str,
     ) -> Result<(User, Token), AppError> {
-        let conn = &mut self.pool.get()?;
-        User::signup(conn, email, username, naive_password)
+        let mut conn = self.pool.acquire().await?;
+        User::signup(&mut conn, email, username, naive_password).await
     }
 
-    fn follow_user(&self, current_user: &User, target_username: &str) -> Result<Profile, AppError> {
-        let conn = &mut self.pool.get()?;
-        let t = User::by_username(target_username);
-
-        let followee = {
-            use diesel::prelude::*;
-            t.first::<User>(conn)?
-        };
+    async fn follow_user(
+        &self,
+        current_user: &User,
+        target_username: &str,
+    ) -> Result<Profile, AppError> {
+        let mut conn = self.pool.acquire().await?;
+        let followee = User::find_by_username(&mut conn, target_username).await?;
 
         Follow::create(
-            conn,
+            &mut conn,
             &CreateFollow {
                 follower_id: current_user.id,
                 followee_id: followee.id,
             },
-        )?;
+        )
+        .await?;
 
         Ok(Profile {
             username: current_user.username.clone(),
@@ -78,25 +85,22 @@ impl UserRepository for UserRepositoryImpl {
         })
     }
 
-    fn unfollow_user(
+    async fn unfollow_user(
         &self,
         current_user: &User,
         target_username: &str,
     ) -> Result<Profile, AppError> {
-        let conn = &mut self.pool.get()?;
-        let t = User::by_username(target_username);
-        let followee = {
-            use diesel::prelude::*;
-            t.first::<User>(conn)?
-        };
+        let mut conn = self.pool.acquire().await?;
+        let followee = User::find_by_username(&mut conn, target_username).await?;
 
         Follow::delete(
-            conn,
+            &mut conn,
             &DeleteFollow {
                 followee_id: followee.id,
                 follower_id: current_user.id,
             },
-        )?;
+        )
+        .await?;
 
         Ok(Profile {
             username: current_user.username.clone(),
@@ -106,16 +110,16 @@ impl UserRepository for UserRepositoryImpl {
         })
     }
 
-    fn update(&self, user_id: Uuid, changeset: UpdateUser) -> Result<(User, Token), AppError> {
-        let conn = &mut self.pool.get()?;
-        let new_user = User::update(conn, user_id, changeset)?;
+    async fn update(&self, user_id: Uuid, changeset: UpdateUser) -> Result<(User, Token), AppError> {
+        let mut conn = self.pool.acquire().await?;
+        let new_user = User::update(&mut conn, user_id, changeset).await?;
         let token = &new_user.generate_token()?;
         Ok((new_user, token.clone()))
     }
 
-    fn find(&self, user_id: Uuid) -> Result<User, AppError> {
-        let conn = &mut self.pool.get()?;
-        let user = User::find(conn, user_id)?;
+    async fn find(&self, user_id: Uuid) -> Result<User, AppError> {
+        let mut conn = self.pool.acquire().await?;
+        let user = User::find(&mut conn, user_id).await?;
         Ok(user)
     }
 }

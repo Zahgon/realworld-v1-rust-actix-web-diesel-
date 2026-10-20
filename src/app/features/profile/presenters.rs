@@ -1,5 +1,6 @@
 use super::entities::Profile as ProfileModel;
-use actix_web::HttpResponse;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::convert::From;
 
@@ -29,7 +30,7 @@ impl From<ProfileModel> for ProfileResponse {
 }
 
 pub trait ProfilePresenter: Send + Sync + 'static {
-    fn to_json(&self, model: ProfileModel) -> HttpResponse;
+    fn to_json(&self, model: ProfileModel) -> Response;
 }
 
 #[derive(Clone)]
@@ -40,8 +41,8 @@ impl ProfilePresenterImpl {
     }
 }
 impl ProfilePresenter for ProfilePresenterImpl {
-    fn to_json(&self, model: ProfileModel) -> HttpResponse {
+    fn to_json(&self, model: ProfileModel) -> Response {
         let res_model = ProfileResponse::from(model);
-        HttpResponse::Ok().json(res_model)
+        Json(res_model).into_response()
     }
 }

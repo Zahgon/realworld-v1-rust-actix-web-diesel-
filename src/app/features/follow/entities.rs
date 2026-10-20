@@ -1,16 +1,11 @@
-use crate::app::features::user::entities::User;
 use crate::error::AppError;
-use crate::schema::follows;
 use chrono::NaiveDateTime;
-use diesel::dsl::Eq;
-use diesel::pg::PgConnection;
-use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::{PgConnection, PgRow};
+use sqlx::{FromRow, Row};
 use uuid::Uuid;
 
-#[derive(Queryable, Associations, Clone, Serialize, Deserialize)]
-#[diesel(belongs_to(User, foreign_key = followee_id, foreign_key = follower_id))]
-#[diesel(table_name = follows)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Follow {
     pub followee_id: Uuid,
     pub follower_id: Uuid,
@@ -18,49 +13,53 @@ pub struct Follow {
     pub updated_at: NaiveDateTime,
 }
 
-type WithFollowee<T> = Eq<follows::followee_id, T>;
-type WithFollower<T> = Eq<follows::follower_id, T>;
-
-impl Follow {
-    pub fn with_followee(followee_id: &Uuid) -> WithFollowee<&Uuid> {
-        follows::followee_id.eq(followee_id)
-    }
-
-    pub fn with_follower(follower_id: &Uuid) -> WithFollower<&Uuid> {
-        follows::follower_id.eq(follower_id)
+impl<'r> FromRow<'r, PgRow> for Follow {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            followee_id: row.try_get(0)?,
+            follower_id: row.try_get(1)?,
+            created_at: row.try_get(2)?,
+            updated_at: row.try_get(3)?,
+        })
     }
 }
 
 impl Follow {
-    pub fn create(conn: &mut PgConnection, params: &CreateFollow) -> Result<(), AppError> {
-        diesel::insert_into(follows::table)
-            .values(params)
-            .execute(conn)?;
+    pub const COLUMNS: &'static str =
+        "follows.followee_id, follows.follower_id, follows.created_at, follows.updated_at";
+
+    pub async fn create(conn: &mut PgConnection, params: &CreateFollow) -> Result<(), AppError> {
+        sqlx::query("INSERT INTO follows (follower_id, followee_id) VALUES ($1, $2)")
+            .bind(params.follower_id)
+            .bind(params.followee_id)
+            .execute(&mut *conn)
+            .await?;
         Ok(())
     }
 
-    pub fn delete(conn: &mut PgConnection, params: &DeleteFollow) -> Result<(), AppError> {
-        let t = follows::table
-            .filter(Follow::with_followee(&params.followee_id))
-            .filter(Follow::with_follower(&params.follower_id));
-        diesel::delete(t).execute(conn)?;
+    pub async fn delete(conn: &mut PgConnection, params: &DeleteFollow) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM follows WHERE follows.followee_id = $1 AND follows.follower_id = $2")
+            .bind(params.followee_id)
+            .bind(params.follower_id)
+            .execute(&mut *conn)
+            .await?;
         Ok(())
     }
 
-    pub fn fetch_folowee_ids_by_follower_id(
+    pub async fn fetch_folowee_ids_by_follower_id(
         conn: &mut PgConnection,
         follower_id: &Uuid,
     ) -> Result<Vec<Uuid>, AppError> {
-        let t = follows::table
-            .filter(Follow::with_follower(follower_id))
-            .select(follows::followee_id);
-        let result = t.get_results::<Uuid>(conn)?;
+        let result = sqlx::query_scalar::<_, Uuid>(
+            "SELECT follows.followee_id FROM follows WHERE follows.follower_id = $1",
+        )
+        .bind(follower_id)
+        .fetch_all(&mut *conn)
+        .await?;
         Ok(result)
     }
 }
 
-#[derive(Insertable)]
-#[diesel(table_name = follows)]
 pub struct CreateFollow {
     pub follower_id: Uuid,
     pub followee_id: Uuid,

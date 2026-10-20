@@ -3,7 +3,8 @@ use crate::app::features::favorite::entities::FavoriteInfo;
 use crate::app::features::profile::entities::Profile;
 use crate::app::features::tag::entities::Tag;
 use crate::utils::date::Iso8601;
-use actix_web::HttpResponse;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::convert::From;
 
@@ -121,9 +122,9 @@ pub struct AuthorContent {
 }
 
 pub trait ArticlePresenter: Send + Sync + 'static {
-    fn to_multi_json(&self, list: ArticlesList, count: i64) -> HttpResponse;
-    fn to_single_json(&self, item: (Article, Profile, FavoriteInfo, Vec<Tag>)) -> HttpResponse;
-    fn to_http_res(&self) -> HttpResponse;
+    fn to_multi_json(&self, list: ArticlesList, count: i64) -> Response;
+    fn to_single_json(&self, item: (Article, Profile, FavoriteInfo, Vec<Tag>)) -> Response;
+    fn to_http_res(&self) -> Response;
 }
 
 #[derive(Clone)]
@@ -134,15 +135,15 @@ impl ArticlePresenterImpl {
     }
 }
 impl ArticlePresenter for ArticlePresenterImpl {
-    fn to_multi_json(&self, list: ArticlesList, count: i64) -> HttpResponse {
+    fn to_multi_json(&self, list: ArticlesList, count: i64) -> Response {
         let res = MultipleArticlesResponse::from((list, count));
-        HttpResponse::Ok().json(res)
+        Json(res).into_response()
     }
-    fn to_single_json(&self, item: (Article, Profile, FavoriteInfo, Vec<Tag>)) -> HttpResponse {
+    fn to_single_json(&self, item: (Article, Profile, FavoriteInfo, Vec<Tag>)) -> Response {
         let res = SingleArticleResponse::from(item);
-        HttpResponse::Ok().json(res)
+        Json(res).into_response()
     }
-    fn to_http_res(&self) -> HttpResponse {
-        HttpResponse::Ok().json(())
+    fn to_http_res(&self) -> Response {
+        Json(()).into_response()
     }
 }

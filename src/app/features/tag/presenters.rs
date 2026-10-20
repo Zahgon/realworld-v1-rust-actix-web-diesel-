@@ -1,5 +1,6 @@
 use super::entities::Tag;
-use actix_web::HttpResponse;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -16,7 +17,7 @@ impl std::convert::From<Vec<Tag>> for TagsResponse {
 }
 
 pub trait TagPresenter: Send + Sync + 'static {
-    fn to_json(&self, list: Vec<Tag>) -> HttpResponse;
+    fn to_json(&self, list: Vec<Tag>) -> Response;
 }
 
 #[derive(Clone)]
@@ -27,8 +28,8 @@ impl TagPresenterImpl {
     }
 }
 impl TagPresenter for TagPresenterImpl {
-    fn to_json(&self, list: Vec<Tag>) -> HttpResponse {
+    fn to_json(&self, list: Vec<Tag>) -> Response {
         let res = TagsResponse::from(list);
-        HttpResponse::Ok().json(res)
+        Json(res).into_response()
     }
 }

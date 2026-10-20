@@ -1,7 +1,8 @@
 use crate::app::features::comment::entities::Comment;
 use crate::app::features::profile::entities::Profile;
 use crate::utils::date::Iso8601;
-use actix_web::HttpResponse;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::convert::From;
 use uuid::Uuid;
@@ -79,9 +80,9 @@ pub struct InnerAuthor {
 }
 
 pub trait CommentPresenter: Send + Sync + 'static {
-    fn to_http_res(&self) -> HttpResponse;
-    fn to_single_json(&self, item: (Comment, Profile)) -> HttpResponse;
-    fn to_multi_json(&self, list: Vec<(Comment, Profile)>) -> HttpResponse;
+    fn to_http_res(&self) -> Response;
+    fn to_single_json(&self, item: (Comment, Profile)) -> Response;
+    fn to_multi_json(&self, list: Vec<(Comment, Profile)>) -> Response;
 }
 
 #[derive(Clone)]
@@ -92,17 +93,17 @@ impl CommentPresenterImpl {
     }
 }
 impl CommentPresenter for CommentPresenterImpl {
-    fn to_http_res(&self) -> HttpResponse {
-        HttpResponse::Ok().json("OK")
+    fn to_http_res(&self) -> Response {
+        Json("OK").into_response()
     }
 
-    fn to_multi_json(&self, list: Vec<(Comment, Profile)>) -> HttpResponse {
+    fn to_multi_json(&self, list: Vec<(Comment, Profile)>) -> Response {
         let res = MultipleCommentsResponse::from(list);
-        HttpResponse::Ok().json(res)
+        Json(res).into_response()
     }
 
-    fn to_single_json(&self, item: (Comment, Profile)) -> HttpResponse {
+    fn to_single_json(&self, item: (Comment, Profile)) -> Response {
         let res = SingleCommentResponse::from(item);
-        HttpResponse::Ok().json(res)
+        Json(res).into_response()
     }
 }

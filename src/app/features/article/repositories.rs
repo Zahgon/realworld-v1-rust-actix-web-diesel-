@@ -5,38 +5,40 @@ use crate::app::features::tag::entities::{CreateTag, Tag};
 use crate::app::features::user::entities::User;
 use crate::error::AppError;
 use crate::utils::db::DbPool;
-use diesel::PgConnection;
+use async_trait::async_trait;
+use sqlx::postgres::PgConnection;
 use uuid::Uuid;
 
+#[async_trait]
 pub trait ArticleRepository: Send + Sync + 'static {
-    fn fetch_articles(
+    async fn fetch_articles(
         &self,
         params: FetchArticlesRepositoryInput,
     ) -> Result<(ArticlesList, ArticlesCount), AppError>;
 
-    fn fetch_article_by_slug(
+    async fn fetch_article_by_slug(
         &self,
         article_title_slug: String,
     ) -> Result<FetchArticleBySlugOutput, AppError>;
 
-    fn create_article(
+    async fn create_article(
         &self,
         params: CreateArticleRepositoryInput,
     ) -> Result<(Article, Profile, FavoriteInfo, Vec<Tag>), AppError>;
 
-    fn delete_article(&self, input: DeleteArticleRepositoryInput) -> Result<(), AppError>;
+    async fn delete_article(&self, input: DeleteArticleRepositoryInput) -> Result<(), AppError>;
 
-    fn update_article(
+    async fn update_article(
         &self,
         input: UpdateArticleRepositoryInput,
     ) -> Result<(Article, Profile, FavoriteInfo, Vec<Tag>), AppError>;
 
-    fn fetch_article(
+    async fn fetch_article(
         &self,
         input: &FetchArticleRepositoryInput,
     ) -> Result<(Article, Profile, FavoriteInfo, Vec<Tag>), AppError>;
 
-    fn fetch_following_articles(
+    async fn fetch_following_articles(
         &self,
         params: &FetchFollowingArticlesRepositoryInput,
     ) -> Result<(ArticlesList, ArticlesCount), AppError>;
@@ -51,117 +53,150 @@ impl ArticleRepositoryImpl {
         Self { pool }
     }
 
-    fn create_tag_list(
+    async fn create_tag_list(
         conn: &mut PgConnection,
         tag_name_list: &Option<Vec<String>>,
         article_id: &Uuid,
     ) -> Result<Vec<Tag>, AppError> {
-        let list = tag_name_list
-            .as_ref()
-            .map(|tag_name_list| {
+        match tag_name_list {
+            Some(tag_name_list) => {
                 let records = tag_name_list
                     .iter()
                     .map(|name| CreateTag { name, article_id })
                     .collect();
-                Tag::create_list(conn, records)
-            })
-            .unwrap_or_else(|| Ok(vec![]));
-        list
+                Tag::create_list(conn, records).await
+            }
+            None => Ok(vec![]),
+        }
+    }
+
+    /// The article-list filters, as `articles.id = ANY(..)` conditions with
+    /// their id lists. A failed lookup aborts the request without a response.
+    async fn article_filters(
+        conn: &mut PgConnection,
+        params: &FetchArticlesRepositoryInput,
+    ) -> Vec<Vec<Uuid>> {
+        use crate::app::features::favorite::entities::Favorite;
+        let mut filters = Vec::new();
+
+        if let Some(tag_name) = &params.tag {
+            let ids = Tag::fetch_article_ids_by_name(conn, tag_name)
+                .await
+                .expect("could not fetch tagged article ids."); // TODO: us e ? or error handling
+            filters.push(ids);
+        }
+
+        if let Some(author_name) = &params.author {
+            let ids = Article::fetch_ids_by_author_name(conn, author_name)
+                .await
+                .expect("could not fetch authors id."); // TODO: use ? or error handling
+            filters.push(ids);
+        }
+
+        if let Some(username) = &params.favorited {
+            let ids = Favorite::fetch_favorited_article_ids_by_username(conn, username)
+                .await
+                .expect("could not fetch favorited articles id."); // TODO: use ? or error handling
+            filters.push(ids);
+        }
+
+        filters
+    }
+
+    fn where_clause(filters: &[Vec<Uuid>]) -> String {
+        if filters.is_empty() {
+            return String::new();
+        }
+        let conditions = (1..=filters.len())
+            .map(|i| format!("articles.id = ANY(${i})"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        format!(" WHERE {conditions}")
+    }
+
+    async fn favorite_info(
+        conn: &mut PgConnection,
+        article: &Article,
+        user_id: &Uuid,
+    ) -> Result<FavoriteInfo, AppError> {
+        let is_favorited = article.is_favorited_by_user_id(conn, user_id).await?;
+        let favorites_count = article.fetch_favorites_count(conn).await?;
+        Ok(FavoriteInfo {
+            is_favorited,
+            favorites_count,
+        })
+    }
+
+    async fn favorites_counts(
+        conn: &mut PgConnection,
+        article_and_user_list: &[(Article, User)],
+    ) -> Result<Vec<i64>, AppError> {
+        let mut list = Vec::with_capacity(article_and_user_list.len());
+        for (article, _) in article_and_user_list {
+            list.push(article.fetch_favorites_count(conn).await?);
+        }
+        Ok(list)
     }
 }
 
+#[async_trait]
 impl ArticleRepository for ArticleRepositoryImpl {
-    fn fetch_articles(
+    async fn fetch_articles(
         &self,
         params: FetchArticlesRepositoryInput,
     ) -> Result<(ArticlesList, ArticlesCount), AppError> {
-        use crate::app::features::favorite::entities::Favorite;
-        use crate::schema::{articles, tags, users};
-        use diesel::prelude::*;
-        // ====
-        let conn = &mut self.pool.get()?;
+        let mut conn = self.pool.acquire().await?;
+        let conn = &mut *conn;
 
-        let query = {
-            let mut query = articles::table.inner_join(users::table).into_boxed();
-
-            if let Some(tag_name) = &params.tag {
-                let ids = Tag::fetch_article_ids_by_name(conn, tag_name)
-                    .expect("could not fetch tagged article ids."); // TODO: us e ? or error handling
-                query = query.filter(articles::id.eq_any(ids));
+        let articles_count = {
+            let filters = Self::article_filters(conn, &params).await;
+            let sql = format!(
+                "SELECT COUNT(articles.id) FROM articles \
+                 INNER JOIN users ON articles.author_id = users.id{} LIMIT 1",
+                Self::where_clause(&filters)
+            );
+            let mut query = sqlx::query_scalar::<_, i64>(&sql).persistent(false);
+            for ids in &filters {
+                query = query.bind(ids);
             }
-
-            if let Some(author_name) = &params.author {
-                let ids = Article::fetch_ids_by_author_name(conn, author_name)
-                    .expect("could not fetch authors id."); // TODO: use ? or error handling
-                query = query.filter(articles::id.eq_any(ids));
-            }
-
-            if let Some(username) = &params.favorited {
-                let ids = Favorite::fetch_favorited_article_ids_by_username(conn, username)
-                    .expect("could not fetch favorited articles id."); // TODO: use ? or error handling
-
-                query = query.filter(articles::id.eq_any(ids));
-            }
-
-            query
+            query.fetch_one(&mut *conn).await?
         };
-        let articles_count = query
-            .select(diesel::dsl::count(articles::id))
-            .first::<i64>(conn)?;
 
         let result = {
-            let query = {
-                let mut query = articles::table.inner_join(users::table).into_boxed();
-
-                if let Some(tag_name) = &params.tag {
-                    let ids = Tag::fetch_article_ids_by_name(conn, tag_name)
-                        .expect("could not fetch tagged article ids."); // TODO: use ? or error handling
-                    query = query.filter(articles::id.eq_any(ids));
+            let article_and_user_list = {
+                let filters = Self::article_filters(conn, &params).await;
+                let sql = format!(
+                    "SELECT {} FROM articles INNER JOIN users ON articles.author_id = users.id{} \
+                     LIMIT ${} OFFSET ${}",
+                    Article::with_author_columns(),
+                    Self::where_clause(&filters),
+                    filters.len() + 1,
+                    filters.len() + 2
+                );
+                let mut query = sqlx::query(&sql).persistent(false);
+                for ids in &filters {
+                    query = query.bind(ids);
                 }
-
-                if let Some(author_name) = &params.author {
-                    let ids = Article::fetch_ids_by_author_name(conn, author_name)
-                        .expect("could not fetch authors id."); // TODO: use ? or error handling
-                    query = query.filter(articles::id.eq_any(ids));
-                }
-
-                if let Some(username) = &params.favorited {
-                    let ids = Favorite::fetch_favorited_article_ids_by_username(conn, username)
-                        .expect("could not fetch favorited articles id."); // TODO: use ? or error handling
-
-                    query = query.filter(articles::id.eq_any(ids));
-                }
-
-                query
+                let rows = query
+                    .bind(params.limit)
+                    .bind(params.offset)
+                    .fetch_all(&mut *conn)
+                    .await?;
+                rows.iter()
+                    .map(Article::with_author_from_row)
+                    .collect::<Result<Vec<_>, _>>()?
             };
-            let article_and_user_list =
-                query
-                    .offset(params.offset)
-                    .limit(params.limit)
-                    .load::<(Article, User)>(conn)?;
 
             let tags_list = {
-                let articles_list = article_and_user_list
-                    .clone()
-                    .into_iter()
-                    .map(|(article, _)| article)
+                let article_ids = article_and_user_list
+                    .iter()
+                    .map(|(article, _)| article.id)
                     .collect::<Vec<_>>();
-                let tags_list = Tag::belonging_to(&articles_list)
-                    .order(tags::name.asc())
-                    .load::<Tag>(conn)?;
-                let tags_list: Vec<Vec<Tag>> = tags_list.grouped_by(&articles_list);
-                tags_list
+                let tags_list = Tag::fetch_by_article_ids(conn, &article_ids, true).await?;
+                Tag::grouped_by(tags_list, &article_ids)
             };
 
-            let favorites_count_list = {
-                let list: Result<Vec<_>, _> = article_and_user_list
-                    .clone()
-                    .into_iter()
-                    .map(|(article, _)| article.fetch_favorites_count(conn))
-                    .collect();
-
-                list?
-            };
+            let favorites_count_list = Self::favorites_counts(conn, &article_and_user_list).await?;
 
             article_and_user_list
                 .into_iter()
@@ -188,38 +223,30 @@ impl ArticleRepository for ArticleRepositoryImpl {
         Ok((result, articles_count))
     }
 
-    fn fetch_article_by_slug(
+    async fn fetch_article_by_slug(
         &self,
         article_title_slug: String,
     ) -> Result<FetchArticleBySlugOutput, AppError> {
-        let conn = &mut self.pool.get()?;
+        let mut conn = self.pool.acquire().await?;
+        let conn = &mut *conn;
 
-        let (article, author) = Article::fetch_by_slug_with_author(conn, &article_title_slug)?;
+        let (article, author) = Article::fetch_by_slug_with_author(conn, &article_title_slug).await?;
 
-        let profile = author.fetch_profile(conn, &author.id)?;
+        let profile = author.fetch_profile(conn, &author.id).await?;
 
-        let tags_list = {
-            use diesel::prelude::*;
-            Tag::belonging_to(&article).load::<Tag>(conn)?
-        };
+        let tags_list = Tag::fetch_by_article_id(conn, &article.id).await?;
 
-        let favorite_info = {
-            let is_favorited = article.is_favorited_by_user_id(conn, &author.id)?;
-            let favorites_count = article.fetch_favorites_count(conn)?;
-            FavoriteInfo {
-                is_favorited,
-                favorites_count,
-            }
-        };
+        let favorite_info = Self::favorite_info(conn, &article, &author.id).await?;
 
         Ok((article, profile, favorite_info, tags_list))
     }
 
-    fn create_article(
+    async fn create_article(
         &self,
         params: CreateArticleRepositoryInput,
     ) -> Result<(Article, Profile, FavoriteInfo, Vec<Tag>), AppError> {
-        let conn = &mut self.pool.get()?;
+        let mut conn = self.pool.acquire().await?;
+        let conn = &mut *conn;
 
         let article = Article::create(
             conn,
@@ -230,42 +257,39 @@ impl ArticleRepository for ArticleRepositoryImpl {
                 description: params.description.clone(),
                 body: params.body.clone(),
             },
-        )?;
+        )
+        .await?;
 
-        let tag_list = Self::create_tag_list(conn, &params.tag_name_list, &article.id)?;
+        let tag_list = Self::create_tag_list(conn, &params.tag_name_list, &article.id).await?;
 
         let profile = params
             .current_user
-            .fetch_profile(conn, &article.author_id)?;
+            .fetch_profile(conn, &article.author_id)
+            .await?;
 
-        let favorite_info = {
-            let is_favorited = article.is_favorited_by_user_id(conn, &params.current_user.id)?;
-            let favorites_count = article.fetch_favorites_count(conn)?;
-            FavoriteInfo {
-                is_favorited,
-                favorites_count,
-            }
-        };
+        let favorite_info = Self::favorite_info(conn, &article, &params.current_user.id).await?;
 
         Ok((article, profile, favorite_info, tag_list))
     }
 
-    fn delete_article(&self, input: DeleteArticleRepositoryInput) -> Result<(), AppError> {
-        let conn = &mut self.pool.get()?;
+    async fn delete_article(&self, input: DeleteArticleRepositoryInput) -> Result<(), AppError> {
+        let mut conn = self.pool.acquire().await?;
         Article::delete(
-            conn,
+            &mut conn,
             &DeleteArticle {
                 slug: input.slug,
                 author_id: input.author_id,
             },
         )
+        .await
     }
 
-    fn update_article(
+    async fn update_article(
         &self,
         input: UpdateArticleRepositoryInput,
     ) -> Result<(Article, Profile, FavoriteInfo, Vec<Tag>), AppError> {
-        let conn = &mut self.pool.get()?;
+        let mut conn = self.pool.acquire().await?;
+        let conn = &mut *conn;
 
         let article = Article::update(
             conn,
@@ -277,114 +301,97 @@ impl ArticleRepository for ArticleRepositoryImpl {
                 description: input.description.to_owned(),
                 body: input.body.to_owned(),
             },
-        )?;
+        )
+        .await?;
 
-        let tag_list = Tag::fetch_by_article_id(conn, &article.id)?;
+        let tag_list = Tag::fetch_by_article_id(conn, &article.id).await?;
 
-        let profile = input.current_user.fetch_profile(conn, &article.author_id)?;
+        let profile = input
+            .current_user
+            .fetch_profile(conn, &article.author_id)
+            .await?;
 
-        let favorite_info = {
-            let is_favorited = article.is_favorited_by_user_id(conn, &input.current_user.id)?;
-            let favorites_count = article.fetch_favorites_count(conn)?;
-            FavoriteInfo {
-                is_favorited,
-                favorites_count,
-            }
-        };
+        let favorite_info = Self::favorite_info(conn, &article, &input.current_user.id).await?;
 
         Ok((article, profile, favorite_info, tag_list))
     }
 
-    fn fetch_article(
+    async fn fetch_article(
         &self,
         input: &FetchArticleRepositoryInput,
     ) -> Result<(Article, Profile, FavoriteInfo, Vec<Tag>), AppError> {
-        let conn = &mut self.pool.get()?;
-        let (article, author) = Article::find_with_author(conn, &input.article_id)?;
+        let mut conn = self.pool.acquire().await?;
+        let conn = &mut *conn;
+        let (article, author) = Article::find_with_author(conn, &input.article_id).await?;
 
-        let profile = input.current_user.fetch_profile(conn, &author.id)?;
+        let profile = input.current_user.fetch_profile(conn, &author.id).await?;
 
-        let favorite_info = {
-            let is_favorited = article.is_favorited_by_user_id(conn, &input.current_user.id)?;
-            let favorites_count = article.fetch_favorites_count(conn)?;
-            FavoriteInfo {
-                is_favorited,
-                favorites_count,
-            }
-        };
+        let favorite_info = Self::favorite_info(conn, &article, &input.current_user.id).await?;
 
-        let tags_list = {
-            use diesel::prelude::*;
-            Tag::belonging_to(&article).load::<Tag>(conn)?
-        };
+        let tags_list = Tag::fetch_by_article_id(conn, &article.id).await?;
 
         Ok((article, profile, favorite_info, tags_list))
     }
 
-    fn fetch_following_articles(
+    async fn fetch_following_articles(
         &self,
         params: &FetchFollowingArticlesRepositoryInput,
     ) -> Result<(ArticlesList, ArticlesCount), AppError> {
         use crate::app::features::follow::entities::Follow;
-        use crate::schema::articles::dsl::*;
-        use crate::schema::follows;
-        use crate::schema::{articles, users};
-        use diesel::prelude::*;
 
-        let conn = &mut self.pool.get()?;
+        let mut conn = self.pool.acquire().await?;
+        let conn = &mut *conn;
 
-        let create_query = {
-            let ids = Follow::fetch_folowee_ids_by_follower_id(conn, &params.current_user.id)?;
-            articles.filter(articles::author_id.eq_any(ids))
-        };
+        let followee_ids =
+            Follow::fetch_folowee_ids_by_follower_id(conn, &params.current_user.id).await?;
 
         let articles_list = {
-            let article_and_user_list = create_query
-                .to_owned()
-                .inner_join(users::table)
-                .limit(params.limit)
-                .offset(params.offset)
-                .order(articles::created_at.desc())
-                .get_results::<(Article, User)>(conn)?;
+            let article_and_user_list = {
+                let rows = sqlx::query(&format!(
+                    "SELECT {} FROM articles INNER JOIN users ON articles.author_id = users.id \
+                     WHERE articles.author_id = ANY($1) \
+                     ORDER BY articles.created_at DESC LIMIT $2 OFFSET $3",
+                    Article::with_author_columns()
+                ))
+                .bind(&followee_ids)
+                .bind(params.limit)
+                .bind(params.offset)
+                .fetch_all(&mut *conn)
+                .await?;
+                rows.iter()
+                    .map(Article::with_author_from_row)
+                    .collect::<Result<Vec<_>, _>>()?
+            };
 
             let tags_list = {
-                let articles_list = article_and_user_list
-                    .clone() // TODO: avoid clone
-                    .into_iter()
-                    .map(|(article, _)| article)
+                let article_ids = article_and_user_list
+                    .iter()
+                    .map(|(article, _)| article.id)
                     .collect::<Vec<_>>();
-
-                let tags_list = Tag::belonging_to(&articles_list).load::<Tag>(conn)?;
-                let tags_list: Vec<Vec<Tag>> = tags_list.grouped_by(&articles_list);
-                tags_list
+                let tags_list = Tag::fetch_by_article_ids(conn, &article_ids, false).await?;
+                Tag::grouped_by(tags_list, &article_ids)
             };
 
             let follows_list = {
                 let user_ids_list = article_and_user_list
-                    .clone() // TODO: avoid clone
-                    .into_iter()
+                    .iter()
                     .map(|(_, user)| user.id)
                     .collect::<Vec<_>>();
 
-                let list = follows::table
-                    .filter(Follow::with_follower(&params.current_user.id))
-                    .filter(follows::followee_id.eq_any(user_ids_list))
-                    .get_results::<Follow>(conn)?;
-
-                list.into_iter()
+                sqlx::query_as::<_, Follow>(&format!(
+                    "SELECT {} FROM follows \
+                     WHERE follows.follower_id = $1 AND follows.followee_id = ANY($2)",
+                    Follow::COLUMNS
+                ))
+                .bind(params.current_user.id)
+                .bind(&user_ids_list)
+                .fetch_all(&mut *conn)
+                .await?
             };
 
-            let favorites_count_list = {
-                let list: Result<Vec<_>, _> = article_and_user_list
-                    .clone()
-                    .into_iter()
-                    .map(|(article, _)| article.fetch_favorites_count(conn))
-                    .collect();
+            let favorites_count_list = Self::favorites_counts(conn, &article_and_user_list).await?;
 
-                list?
-            };
-
-            let favorited_article_ids = params.current_user.fetch_favorited_article_ids(conn)?;
+            let favorited_article_ids = params.current_user.fetch_favorited_article_ids(conn).await?;
             let is_favorited_by_me = |article: &Article| {
                 favorited_article_ids
                     .iter()
@@ -396,7 +403,7 @@ impl ArticleRepository for ArticleRepositoryImpl {
                 .into_iter()
                 .zip(favorites_count_list)
                 .map(|((article, user), favorites_count)| {
-                    let following = follows_list.clone().any(|item| item.followee_id == user.id);
+                    let following = follows_list.iter().any(|item| item.followee_id == user.id);
                     let is_favorited = is_favorited_by_me(&article);
                     (
                         article,
@@ -404,7 +411,7 @@ impl ArticleRepository for ArticleRepositoryImpl {
                             username: user.username,
                             bio: user.bio,
                             image: user.image,
-                            following: following.to_owned(),
+                            following,
                         },
                         FavoriteInfo {
                             is_favorited,
@@ -416,9 +423,12 @@ impl ArticleRepository for ArticleRepositoryImpl {
                 .collect::<Vec<_>>()
         };
 
-        let articles_count = create_query
-            .select(diesel::dsl::count(articles::id))
-            .first::<i64>(conn)?;
+        let articles_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(articles.id) FROM articles WHERE articles.author_id = ANY($1) LIMIT 1",
+        )
+        .bind(&followee_ids)
+        .fetch_one(&mut *conn)
+        .await?;
 
         Ok((articles_list, articles_count))
     }

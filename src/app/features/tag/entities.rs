@@ -1,28 +1,12 @@
-use crate::app::features::article::entities::Article;
 use crate::error::AppError;
-use crate::schema::tags;
 use chrono::NaiveDateTime;
-use diesel::backend::Backend;
-use diesel::dsl::{AsSelect, Eq, Filter, Select};
-use diesel::pg::PgConnection;
-use diesel::Insertable;
-use diesel::*;
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::{PgConnection, PgRow};
+use sqlx::{FromRow, Row};
+use std::collections::HashMap;
 use uuid::Uuid;
 
-#[derive(
-    Identifiable,
-    Selectable,
-    Queryable,
-    Debug,
-    Serialize,
-    Deserialize,
-    Clone,
-    Associations,
-    QueryableByName,
-)]
-#[diesel(belongs_to(Article, foreign_key = article_id))]
-#[diesel(table_name = tags)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Tag {
     pub id: Uuid,
     pub article_id: Uuid,
@@ -31,83 +15,118 @@ pub struct Tag {
     pub updated_at: NaiveDateTime,
 }
 
-// Tags
-type All<DB> = Select<tags::table, AsSelect<Tag, DB>>;
-type WithName<T> = Eq<tags::name, T>;
-type ByName<T, DB> = Filter<All<DB>, WithName<T>>;
-type WithArticleId<T> = Eq<tags::article_id, T>;
-type ByArticleId<T, DB> = Filter<All<DB>, WithArticleId<T>>;
-
-impl Tag {
-    fn all<DB>() -> All<DB>
-    where
-        DB: Backend,
-    {
-        tags::table.select(Tag::as_select())
-    }
-
-    fn with_name(name: &str) -> WithName<&str> {
-        tags::name.eq(name)
-    }
-
-    fn by_name<DB>(name: &str) -> ByName<&str, DB>
-    where
-        DB: Backend,
-    {
-        Self::all().filter(Self::with_name(name))
-    }
-
-    fn with_article_id(article_id: &Uuid) -> WithArticleId<&Uuid> {
-        tags::article_id.eq(article_id)
-    }
-
-    fn by_article_id<DB>(article_id: &Uuid) -> ByArticleId<&Uuid, DB>
-    where
-        DB: Backend,
-    {
-        Self::all().filter(Self::with_article_id(article_id))
-    }
-
-    pub fn fetch_by_article_id(
-        conn: &mut PgConnection,
-        article_id: &Uuid,
-    ) -> Result<Vec<Self>, AppError> {
-        let t = Self::by_article_id(article_id);
-        let list = t.get_results::<Self>(conn)?;
-        Ok(list)
-    }
-
-    pub fn fetch(conn: &mut PgConnection) -> Result<Vec<Self>, AppError> {
-        let list = tags::table.load::<Self>(conn)?;
-        Ok(list)
-    }
-
-    pub fn fetch_article_ids_by_name(
-        conn: &mut PgConnection,
-        tag_name: &str,
-    ) -> Result<Vec<Uuid>, AppError> {
-        let t = Self::by_name(tag_name);
-        let article_ids = t
-            .load::<Tag>(conn)?
-            .iter()
-            .map(|tag| tag.article_id)
-            .collect();
-        Ok(article_ids)
-    }
-
-    pub fn create_list(
-        conn: &mut PgConnection,
-        records: Vec<CreateTag>,
-    ) -> Result<Vec<Self>, AppError> {
-        let tags_list = diesel::insert_into(tags::table)
-            .values(records)
-            .get_results::<Tag>(conn)?;
-        Ok(tags_list)
+impl<'r> FromRow<'r, PgRow> for Tag {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get(0)?,
+            article_id: row.try_get(1)?,
+            name: row.try_get(2)?,
+            created_at: row.try_get(3)?,
+            updated_at: row.try_get(4)?,
+        })
     }
 }
 
-#[derive(Insertable)]
-#[diesel(table_name = tags)]
+impl Tag {
+    pub const COLUMNS: &'static str =
+        "tags.id, tags.article_id, tags.name, tags.created_at, tags.updated_at";
+
+    pub async fn fetch_by_article_id(
+        conn: &mut PgConnection,
+        article_id: &Uuid,
+    ) -> Result<Vec<Self>, AppError> {
+        let list = sqlx::query_as::<_, Self>(&format!(
+            "SELECT {} FROM tags WHERE tags.article_id = $1",
+            Self::COLUMNS
+        ))
+        .bind(article_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(list)
+    }
+
+    /// Tags of the given articles, optionally sorted by name.
+    pub async fn fetch_by_article_ids(
+        conn: &mut PgConnection,
+        article_ids: &[Uuid],
+        order_by_name: bool,
+    ) -> Result<Vec<Self>, AppError> {
+        let order = if order_by_name { " ORDER BY tags.name ASC" } else { "" };
+        let list = sqlx::query_as::<_, Self>(&format!(
+            "SELECT {} FROM tags WHERE tags.article_id = ANY($1){order}",
+            Self::COLUMNS
+        ))
+        .bind(article_ids)
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(list)
+    }
+
+    pub async fn fetch(conn: &mut PgConnection) -> Result<Vec<Self>, AppError> {
+        let list = sqlx::query_as::<_, Self>(&format!("SELECT {} FROM tags", Self::COLUMNS))
+            .fetch_all(&mut *conn)
+            .await?;
+        Ok(list)
+    }
+
+    pub async fn fetch_article_ids_by_name(
+        conn: &mut PgConnection,
+        tag_name: &str,
+    ) -> Result<Vec<Uuid>, AppError> {
+        let article_ids = sqlx::query_as::<_, Self>(&format!(
+            "SELECT {} FROM tags WHERE tags.name = $1",
+            Self::COLUMNS
+        ))
+        .bind(tag_name)
+        .fetch_all(&mut *conn)
+        .await?
+        .iter()
+        .map(|tag| tag.article_id)
+        .collect();
+        Ok(article_ids)
+    }
+
+    /// Inserts all records with one statement; an empty list inserts nothing.
+    pub async fn create_list(
+        conn: &mut PgConnection,
+        records: Vec<CreateTag<'_>>,
+    ) -> Result<Vec<Self>, AppError> {
+        if records.is_empty() {
+            return Ok(vec![]);
+        }
+        let values = (0..records.len())
+            .map(|i| format!("(${}, ${})", 2 * i + 1, 2 * i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO tags (name, article_id) VALUES {values} RETURNING {}",
+            Self::COLUMNS
+        );
+        let mut query = sqlx::query_as::<_, Self>(&sql);
+        for record in &records {
+            query = query.bind(record.name).bind(record.article_id);
+        }
+        let tags_list = query.fetch_all(&mut *conn).await?;
+        Ok(tags_list)
+    }
+
+    /// Splits `tags` into one list per article, in the order of `article_ids`.
+    pub fn grouped_by(tags: Vec<Self>, article_ids: &[Uuid]) -> Vec<Vec<Self>> {
+        let index: HashMap<Uuid, usize> = article_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i))
+            .collect();
+        let mut grouped: Vec<Vec<Self>> = article_ids.iter().map(|_| Vec::new()).collect();
+        for tag in tags {
+            if let Some(&i) = index.get(&tag.article_id) {
+                grouped[i].push(tag);
+            }
+        }
+        grouped
+    }
+}
+
 pub struct CreateTag<'a> {
     pub name: &'a str,
     pub article_id: &'a Uuid,

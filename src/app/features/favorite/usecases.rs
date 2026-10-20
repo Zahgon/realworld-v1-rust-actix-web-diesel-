@@ -3,7 +3,7 @@ use super::repositories::FavoriteRepository;
 use crate::app::features::article::repositories::{ArticleRepository, FetchArticleRepositoryInput};
 use crate::app::features::user::entities::User;
 use crate::error::AppError;
-use actix_web::HttpResponse;
+use axum::response::Response;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -26,40 +26,44 @@ impl FavoriteUsecase {
         }
     }
 
-    pub fn favorite_article(
+    pub async fn favorite_article(
         &self,
         user: User,
         article_title_slug: String,
-    ) -> Result<HttpResponse, AppError> {
+    ) -> Result<Response, AppError> {
         let article = self
             .favorite_repository
-            .favorite_article(user.clone(), article_title_slug)?;
+            .favorite_article(user.clone(), article_title_slug)
+            .await?;
 
         let result = self
             .article_repository
             .fetch_article(&FetchArticleRepositoryInput {
                 article_id: article.id,
                 current_user: user,
-            })?;
+            })
+            .await?;
         let res = self.favorite_presenter.to_single_json(result);
         Ok(res)
     }
 
-    pub fn unfavorite_article(
+    pub async fn unfavorite_article(
         &self,
         user: User,
         article_title_slug: String,
-    ) -> Result<HttpResponse, AppError> {
+    ) -> Result<Response, AppError> {
         let article = self
             .favorite_repository
-            .unfavorite_article(user.clone(), article_title_slug)?;
+            .unfavorite_article(user.clone(), article_title_slug)
+            .await?;
 
         let result = self
             .article_repository
             .fetch_article(&FetchArticleRepositoryInput {
                 article_id: article.id,
                 current_user: user,
-            })?;
+            })
+            .await?;
 
         let res = self.favorite_presenter.to_single_json(result);
         Ok(res)

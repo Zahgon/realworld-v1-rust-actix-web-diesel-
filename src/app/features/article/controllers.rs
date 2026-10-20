@@ -5,10 +5,11 @@ use super::{
         UpdateArticleUsecaseInput,
     },
 };
-use crate::app::drivers::middlewares::auth;
+use crate::app::drivers::extractors::{Json, Query};
+use crate::app::drivers::middlewares::auth::{self, CurrentUser};
 use crate::app::drivers::middlewares::state::AppState;
 use crate::utils::api::ApiResponse;
-use actix_web::{web, HttpRequest};
+use axum::extract::{Path, State};
 use serde::Deserialize;
 
 type ArticleTitleSlug = String;
@@ -23,8 +24,8 @@ pub struct ArticlesListQueryParameter {
 }
 
 pub async fn index(
-    state: web::Data<AppState>,
-    params: web::Query<ArticlesListQueryParameter>,
+    State(state): State<AppState>,
+    params: Query<ArticlesListQueryParameter>,
 ) -> ApiResponse {
     let offset = std::cmp::min(params.offset.to_owned().unwrap_or(0), 100);
     let limit = params.limit.unwrap_or(20);
@@ -38,6 +39,7 @@ pub async fn index(
             offset,
             limit,
         })
+        .await
 }
 
 #[derive(Deserialize)]
@@ -47,9 +49,9 @@ pub struct FeedQueryParameter {
 }
 
 pub async fn feed(
-    state: web::Data<AppState>,
-    req: HttpRequest,
-    params: web::Query<FeedQueryParameter>,
+    State(state): State<AppState>,
+    req: CurrentUser,
+    params: Query<FeedQueryParameter>,
 ) -> ApiResponse {
     let current_user = auth::get_current_user(&req)?;
     let offset = std::cmp::min(params.offset.to_owned().unwrap_or(0), 100);
@@ -58,20 +60,24 @@ pub async fn feed(
         .di_container
         .article_usecase
         .fetch_following_articles(current_user, offset, limit)
+        .await
 }
 
-pub async fn show(state: web::Data<AppState>, path: web::Path<ArticleTitleSlug>) -> ApiResponse {
-    let article_title_slug = path.into_inner();
+pub async fn show(
+    State(state): State<AppState>,
+    Path(article_title_slug): Path<ArticleTitleSlug>,
+) -> ApiResponse {
     state
         .di_container
         .article_usecase
         .fetch_article_by_slug(article_title_slug)
+        .await
 }
 
 pub async fn create(
-    state: web::Data<AppState>,
-    req: HttpRequest,
-    form: web::Json<requests::CreateArticleRequest>,
+    State(state): State<AppState>,
+    req: CurrentUser,
+    form: Json<requests::CreateArticleRequest>,
 ) -> ApiResponse {
     let current_user = auth::get_current_user(&req)?;
     state
@@ -84,16 +90,16 @@ pub async fn create(
             tag_name_list: form.article.tag_list.to_owned(),
             current_user,
         })
+        .await
 }
 
 pub async fn update(
-    state: web::Data<AppState>,
-    req: HttpRequest,
-    path: web::Path<ArticleTitleSlug>,
-    form: web::Json<requests::UpdateArticleRequest>,
+    State(state): State<AppState>,
+    req: CurrentUser,
+    Path(article_title_slug): Path<ArticleTitleSlug>,
+    form: Json<requests::UpdateArticleRequest>,
 ) -> ApiResponse {
     let current_user = auth::get_current_user(&req)?;
-    let article_title_slug = path.into_inner();
     let title = form.article.title.clone();
     let description = form.article.description.clone();
     let body = form.article.body.clone();
@@ -107,15 +113,15 @@ pub async fn update(
             description,
             body,
         })
+        .await
 }
 
 pub async fn delete(
-    state: web::Data<AppState>,
-    req: HttpRequest,
-    path: web::Path<ArticleTitleSlug>,
+    State(state): State<AppState>,
+    req: CurrentUser,
+    Path(article_title_slug): Path<ArticleTitleSlug>,
 ) -> ApiResponse {
     let current_user = auth::get_current_user(&req)?;
-    let article_title_slug = path.into_inner();
     state
         .di_container
         .article_usecase
@@ -123,4 +129,5 @@ pub async fn delete(
             author_id: current_user.id,
             slug: article_title_slug,
         })
+        .await
 }

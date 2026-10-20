@@ -3,7 +3,7 @@ use super::repositories::ProfileRepository;
 use crate::app::features::user::entities::User;
 use crate::app::features::user::repositories::UserRepository;
 use crate::error::AppError;
-use actix_web::HttpResponse;
+use axum::response::Response;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -26,36 +26,39 @@ impl ProfileUsecase {
         }
     }
 
-    pub fn fetch_profile_by_name(
+    pub async fn fetch_profile_by_name(
         &self,
         current_user: &User,
         username: &str,
-    ) -> Result<HttpResponse, AppError> {
+    ) -> Result<Response, AppError> {
         let profile = self
             .profile_repository
-            .fetch_profile_by_name(current_user, username)?;
+            .fetch_profile_by_name(current_user, username)
+            .await?;
         Ok(self.presenter.to_json(profile))
     }
 
-    pub fn follow_user(
+    pub async fn follow_user(
         &self,
         current_user: &User,
         target_username: &str,
-    ) -> Result<HttpResponse, AppError> {
+    ) -> Result<Response, AppError> {
         let profile = self
             .user_repository
-            .follow_user(current_user, target_username)?;
+            .follow_user(current_user, target_username)
+            .await?;
         Ok(self.presenter.to_json(profile))
     }
 
-    pub fn unfollow_user(
+    pub async fn unfollow_user(
         &self,
         current_user: &User,
         target_username: &str,
-    ) -> Result<HttpResponse, AppError> {
+    ) -> Result<Response, AppError> {
         let profile = self
             .user_repository
-            .unfollow_user(current_user, target_username)?;
+            .unfollow_user(current_user, target_username)
+            .await?;
         Ok(self.presenter.to_json(profile))
     }
 }

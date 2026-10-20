@@ -1,17 +1,10 @@
-use crate::app::features::article::entities::Article;
-use crate::app::features::user::entities::User;
 use crate::error::AppError;
-use crate::schema::favorites;
 use chrono::NaiveDateTime;
-use diesel::dsl::Eq;
-use diesel::*;
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgConnection;
 use uuid::Uuid;
 
-#[derive(Serialize, Deserialize, Queryable, Identifiable, Associations, Clone, Debug)]
-#[diesel(belongs_to(Article, foreign_key = article_id))]
-#[diesel(belongs_to(User, foreign_key = user_id))]
-#[diesel(table_name = favorites)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Favorite {
     pub id: Uuid,
     pub article_id: Uuid,
@@ -20,57 +13,49 @@ pub struct Favorite {
     pub updated_at: NaiveDateTime,
 }
 
-type WithUserId<T> = Eq<favorites::user_id, T>;
-type WithArticleId<T> = Eq<favorites::article_id, T>;
-
 impl Favorite {
-    pub fn with_user_id(user_id: &Uuid) -> WithUserId<&Uuid> {
-        favorites::user_id.eq_all(user_id)
+    pub async fn create(conn: &mut PgConnection, record: &CreateFavorite) -> Result<usize, AppError> {
+        let result = sqlx::query("INSERT INTO favorites (user_id, article_id) VALUES ($1, $2)")
+            .bind(record.user_id)
+            .bind(record.article_id)
+            .execute(&mut *conn)
+            .await?;
+        Ok(result.rows_affected() as usize)
     }
 
-    pub fn with_article_id(article_id: &Uuid) -> WithArticleId<&Uuid> {
-        favorites::article_id.eq_all(article_id)
-    }
-}
-
-impl Favorite {
-    pub fn create(conn: &mut PgConnection, record: &CreateFavorite) -> Result<usize, AppError> {
-        let item = diesel::insert_into(favorites::table)
-            .values(record)
-            .execute(conn)?;
-        Ok(item)
-    }
-
-    pub fn delete(
+    pub async fn delete(
         conn: &mut PgConnection,
         DeleteFavorite {
             user_id,
             article_id,
         }: &DeleteFavorite,
     ) -> Result<usize, AppError> {
-        let t = favorites::table
-            .filter(Self::with_user_id(user_id))
-            .filter(Self::with_article_id(article_id));
-        let item = diesel::delete(t).execute(conn)?;
-        Ok(item)
+        let result = sqlx::query(
+            "DELETE FROM favorites WHERE favorites.user_id = $1 AND favorites.article_id = $2",
+        )
+        .bind(user_id)
+        .bind(article_id)
+        .execute(&mut *conn)
+        .await?;
+        Ok(result.rows_affected() as usize)
     }
 
-    pub fn fetch_favorited_article_ids_by_username(
+    pub async fn fetch_favorited_article_ids_by_username(
         conn: &mut PgConnection,
         username: &str,
     ) -> Result<Vec<Uuid>, AppError> {
-        use crate::schema::users;
-        let t = favorites::table
-            .inner_join(users::table)
-            .filter(User::with_username(username))
-            .select(favorites::article_id);
-        let ids = t.load::<Uuid>(conn)?;
+        let ids = sqlx::query_scalar::<_, Uuid>(
+            "SELECT favorites.article_id FROM favorites \
+             INNER JOIN users ON favorites.user_id = users.id \
+             WHERE users.username = $1",
+        )
+        .bind(username)
+        .fetch_all(&mut *conn)
+        .await?;
         Ok(ids)
     }
 }
 
-#[derive(Insertable)]
-#[diesel(table_name = favorites)]
 pub struct CreateFavorite {
     pub user_id: Uuid,
     pub article_id: Uuid,
